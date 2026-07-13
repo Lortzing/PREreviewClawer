@@ -4,7 +4,11 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
+
+# Pipeline outputs and caches
+data/pipeline/
+.ipynb_checkpoints/
