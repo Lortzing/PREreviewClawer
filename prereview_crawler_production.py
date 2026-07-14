@@ -41,8 +41,8 @@ except ImportError:  # pragma: no cover - reported in collection statistics
     fitz = None
 
 COLUMNS = ["DOI", "PaperTitle", "Authors", "Source", "Venue", "Year", "PeerReview", "Field"]
-ZENODO_API = "https://zenodo.org/api/records"
 COMMUNITY = "prereview-reviews"
+ZENODO_API = f"https://zenodo.org/api/communities/{COMMUNITY}/records"
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 ZENODO_DOI_RE = re.compile(r"10\.5281/zenodo\.\d+", re.I)
 ARXIV_RE = re.compile(r"(?:arxiv:|arxiv\.org/(?:abs|pdf)/)?([a-z.-]+/\d{7}|\d{4}\.\d{4,5})(?:v(\d+))?", re.I)
@@ -68,7 +68,8 @@ FORBIDDEN_VENUE_FRAGMENTS = (
     "fapunifesp", "publisher", " llc", " bv",
 )
 CURRENT_YEAR = datetime.now(UTC).year
-STATE_VERSION = 3
+STATE_VERSION = 4
+COMMENTING_RELAUNCH_DATE = "2024-11-12"
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -115,6 +116,7 @@ class Review:
     title_hint: str
     record_url: str
     creators: list[str] = field(default_factory=list)
+    creator_orcids: list[str] = field(default_factory=list)
     subjects: list[str] = field(default_factory=list)
 
 
@@ -128,7 +130,23 @@ class AuthorResponse:
     response_date: str
     record_url: str
     creators: list[str] = field(default_factory=list)
+    creator_orcids: list[str] = field(default_factory=list)
     body_source: str = ""
+
+
+@dataclass
+class DiscussionComment:
+    comment_id: str
+    record_id: str
+    target_review_id: str
+    family_key: str
+    content: str
+    comment_date: str
+    record_url: str
+    creators: list[str] = field(default_factory=list)
+    creator_orcids: list[str] = field(default_factory=list)
+    body_source: str = ""
+    target_relation_verified: bool = False
 
 
 @dataclass
@@ -162,10 +180,13 @@ def clean_text(value: Any, separator: str = "\n") -> str:
         raw,
         flags=re.I | re.S,
     )
-    soup = BeautifulSoup(raw, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    raw_text = soup.get_text(separator)
+    if "<" not in raw and ">" not in raw:
+        raw_text = raw
+    else:
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        raw_text = soup.get_text(separator)
     lines = [re.sub(r"[\t\r\f\v ]+", " ", line).strip() for line in raw_text.splitlines()]
     out: list[str] = []
     blank = False
@@ -367,6 +388,73 @@ def author_only_response(response: str, review: str) -> str:
     output.extend(f"Author response {number}: {answer}" for number, answer in enumerate(answers, 1))
     return "\n\n".join(output) if output else response
 
+
+def normalized_person_tokens(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKD", clean_text(value, " ")).casefold()
+    normalized = "".join(character for character in normalized if not unicodedata.combining(character))
+    return tuple(sorted(re.findall(r"[a-z0-9]+", normalized)))
+
+
+def person_lists_overlap(left: Iterable[str], right: Iterable[str]) -> bool:
+    left_keys = {key for value in left if (key := normalized_person_tokens(value))}
+    right_keys = {key for value in right if (key := normalized_person_tokens(value))}
+    return bool(left_keys & right_keys)
+
+
+def normalize_orcid(value: Any) -> str:
+    match = re.search(r"\b(\d{4}-\d{4}-\d{4}-\d{3}[\dX])\b", clean_text(value, " "), re.I)
+    return match.group(1).upper() if match else ""
+
+
+def orcid_lists_overlap(left: Iterable[str], right: Iterable[str]) -> bool:
+    left_values = {normalized for value in left if (normalized := normalize_orcid(value))}
+    right_values = {normalized for value in right if (normalized := normalize_orcid(value))}
+    return bool(left_values & right_values)
+
+
+AUTHOR_RESPONSE_PATTERNS = (
+    r"\bauthor(?:s['’]?)?\s+(?:response|reply|rebuttal)\b",
+    r"\bresponse(?:s)?\s+to\s+(?:the\s+)?reviewers?\b",
+    r"\bwe,?\s+as\s+(?:the\s+)?authors?\b",
+    r"\bwe\s+(?:sincerely\s+)?thank\s+(?:the\s+)?(?:anonymous\s+)?reviewers?\b",
+    r"\bthank(?:s|\s+you)?\s+(?:very\s+much\s+)?for\s+your\s+(?:pre)?review\b",
+    r"\bthank\s+you\s+for\s+reviewing\s+our\s+manuscript\b",
+    r"\bwe\s+(?:gladly\s+)?respond\s+(?:below|to\s+(?:each|the))\b",
+    r"\bour\s+responses?\s+(?:are|is)\s+below\b",
+    r"\bpaper\s+has\s+been\s+updated\s+in\s+response\s+to\s+the\s+pre-?review\b",
+    r"\bgracias\s+por\s+su\s+revisi[oó]n\b",
+    r"\bagrade[cç]o\s+(?:pelas?|por\s+suas?)\s+(?:sugest[oõ]es|revis[aã]o|coment[aá]rios)\b",
+)
+
+
+def author_response_text_evidence(value: str) -> str:
+    opening = clean_text(value, " ")[:2000]
+    for pattern in AUTHOR_RESPONSE_PATTERNS:
+        if re.search(pattern, opening, re.I):
+            return f"comment text matches author-response pattern: {pattern}"
+    return ""
+
+
+def discussion_participant_role(
+    discussion: DiscussionComment,
+    paper_authors: Iterable[str],
+    review_creators: Iterable[str],
+    paper_author_orcids: Iterable[str] = (),
+    review_creator_orcids: Iterable[str] = (),
+) -> tuple[str, str]:
+    if orcid_lists_overlap(discussion.creator_orcids, paper_author_orcids):
+        return "author", "commenter ORCID matches resolved paper author"
+    if orcid_lists_overlap(discussion.creator_orcids, review_creator_orcids):
+        return "reviewer", "commenter ORCID matches PREreview creator"
+    text_evidence = author_response_text_evidence(discussion.content)
+    if text_evidence:
+        return "author", text_evidence
+    if person_lists_overlap(discussion.creators, paper_authors):
+        return "author", "commenter name matches resolved paper author"
+    if person_lists_overlap(discussion.creators, review_creators):
+        return "reviewer", "commenter name matches PREreview creator"
+    return "commenter", "role is not asserted by Zenodo metadata"
+
 BROAD_FIELD_VENUE_MAP = {
     "bioRxiv": "Biological Sciences",
     "medRxiv": "Medicine and Health Sciences",
@@ -452,7 +540,7 @@ def explicit_target(record: dict[str, Any]) -> tuple[Target | None, str]:
         if not candidate_doi and raw.lower().startswith(("http://", "https://")):
             path = urlparse(raw).path.lstrip("/")
             candidate_doi = normalize_doi(path)
-        if candidate_doi and not ZENODO_DOI_RE.fullmatch(candidate_doi):
+        if candidate_doi:
             family, version = family_and_version(candidate_doi, "doi")
             accepted.append(Target("doi", candidate_doi, candidate_doi, family, version, scheme or "doi", raw))
             continue
@@ -509,13 +597,22 @@ def review_type_and_title(title: Any) -> tuple[str, str]:
     return review_type, hint
 
 
-def creators_from_record(record: dict[str, Any]) -> list[str]:
-    out: list[str] = []
+def creator_identities_from_record(record: dict[str, Any]) -> tuple[list[str], list[str]]:
+    names_out: list[str] = []
+    orcids_out: list[str] = []
     for creator in (record.get("metadata") or {}).get("creators") or []:
         name = clean_text(creator.get("name") if isinstance(creator, dict) else creator, " ")
-        if name and name not in out:
-            out.append(name)
-    return out
+        if name and name not in names_out:
+            names_out.append(name)
+        if isinstance(creator, dict):
+            orcid = normalize_orcid(creator.get("orcid") or creator.get("nameIdentifiers"))
+            if orcid and orcid not in orcids_out:
+                orcids_out.append(orcid)
+    return names_out, orcids_out
+
+
+def creators_from_record(record: dict[str, Any]) -> list[str]:
+    return creator_identities_from_record(record)[0]
 
 
 def subjects_from_record(record: dict[str, Any]) -> list[str]:
@@ -555,6 +652,25 @@ def names(items: Any) -> list[str]:
             name = ""
         if name and name not in out:
             out.append(name)
+    return out
+
+
+def orcids_from_people(items: Any) -> list[str]:
+    out: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        candidates: list[Any] = [item.get("ORCID"), item.get("orcid")]
+        person = item.get("person_or_org")
+        if isinstance(person, dict):
+            candidates.extend([person.get("orcid"), person.get("ORCID")])
+        for identifier in item.get("nameIdentifiers") or []:
+            if isinstance(identifier, dict):
+                candidates.append(identifier.get("nameIdentifier"))
+        for candidate in candidates:
+            orcid = normalize_orcid(candidate)
+            if orcid and orcid not in out:
+                out.append(orcid)
     return out
 
 
@@ -608,6 +724,9 @@ def venue_from_identifier(target: Target) -> str:
         ("10.48550/arxiv.", "arXiv"), ("10.26434/chemrxiv", "ChemRxiv"),
         ("10.20944/preprints", "Preprints.org"), ("10.64898/", "openRxiv"),
         ("10.21203/", "Research Square"), ("10.22541/", "Authorea"),
+        ("10.1590/scielopreprints.", "SciELO Preprints"),
+        ("10.36227/techrxiv.", "TechRxiv"),
+        ("10.32942/", "EcoEvoRxiv"),
     ]
     for prefix, label in prefix_map:
         if doi_value.startswith(prefix):
@@ -648,6 +767,7 @@ class Collector:
         sampling_policy: str = "hash",
         refresh_zenodo: bool = False,
         refresh_metadata: bool = False,
+        allow_partial_scan: bool = False,
     ) -> None:
         self.delay = delay
         self.seed = seed
@@ -663,6 +783,7 @@ class Collector:
         self.sampling_policy = sampling_policy
         self.refresh_zenodo = refresh_zenodo
         self.refresh_metadata = refresh_metadata
+        self.allow_partial_scan = allow_partial_scan
         if field_policy not in {"empty", "native", "metadata", "broad"}:
             raise ValueError(f"unsupported field policy: {field_policy}")
         if sampling_policy not in {"hash", "coverage"}:
@@ -678,6 +799,9 @@ class Collector:
         self.session.headers.update({"Accept": "application/json", "User-Agent": user_agent})
         self.metadata_cache: dict[str, dict[str, Any] | None] = {}
         self.request_counts: Counter[str] = Counter()
+        self.zenodo_duplicate_records = 0
+        self.zenodo_reported_total: int | None = None
+        self.zenodo_scan_complete = False
 
     def cache_path(self, namespace: str, key: str, suffix: str = ".json") -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -718,7 +842,10 @@ class Collector:
 
     def cached_text_request(self, namespace: str, key: str, url: str, retries: int = 4) -> str:
         path = self.cache_path(namespace, key, ".txt")
-        if self.resume and not (self.refresh_metadata and namespace == "arxiv"):
+        refresh = (self.refresh_metadata and namespace == "arxiv") or (
+            self.refresh_zenodo and namespace == "zenodo_files"
+        )
+        if self.resume and not refresh:
             try:
                 return path.read_text(encoding="utf-8")
             except (FileNotFoundError, OSError):
@@ -732,7 +859,8 @@ class Collector:
 
     def cached_bytes_request(self, namespace: str, key: str, url: str, retries: int = 4) -> bytes:
         path = self.cache_path(namespace, key, ".bin")
-        if self.resume:
+        refresh = self.refresh_zenodo and namespace == "zenodo_files"
+        if self.resume and not refresh:
             try:
                 return path.read_bytes()
             except (FileNotFoundError, OSError):
@@ -808,16 +936,22 @@ class Collector:
 
     def iter_zenodo_records(self, max_pages: int, page_size: int = 25):
         records_seen = 0
+        seen_record_ids: set[str] = set()
         reported_total: int | None = None
         exhausted = False
         for page in range(1, max_pages + 1):
             params = {
-                "communities": COMMUNITY,
-                "sort": "mostrecent",
+                "sort": "publication-desc",
+                "access_status": "open",
                 "size": page_size,
                 "page": page,
             }
-            cache_key = f"{COMMUNITY}|mostrecent|{page_size}|{page}"
+            cache_key = f"community-v2|{COMMUNITY}|publication-desc|open|{page_size}|{page}"
+            cache_hit = (
+                self.resume
+                and not self.refresh_zenodo
+                and self.cache_path("zenodo_pages", cache_key).exists()
+            )
             payload = self.cached_json_request("zenodo_pages", cache_key, ZENODO_API, params=params)
             hits = (payload.get("hits") or {}).get("hits") or []
             total = (payload.get("hits") or {}).get("total")
@@ -825,43 +959,69 @@ class Collector:
                 total = total.get("value")
             if isinstance(total, int):
                 reported_total = total
+                self.zenodo_reported_total = total
             logging.info(
                 "Zenodo page %d: %d records (reported total=%s, source=%s)",
                 page,
                 len(hits),
                 total,
-                "cache" if self.resume and self.cache_path("zenodo_pages", cache_key).exists() else "network",
+                "cache" if cache_hit else "network",
             )
             if not hits:
                 exhausted = True
                 break
-            records_seen += len(hits)
-            yield from hits
+            for record in hits:
+                record_id = str(record.get("id") or record.get("recid") or record.get("doi") or "")
+                if not record_id or record_id in seen_record_ids:
+                    self.zenodo_duplicate_records += 1
+                    continue
+                seen_record_ids.add(record_id)
+                records_seen += 1
+                yield record
             if len(hits) < page_size:
                 exhausted = True
                 break
-        if not exhausted and reported_total is not None and records_seen < reported_total:
-            raise RuntimeError(
-                f"Zenodo scan incomplete: scanned {records_seen} of {reported_total} records; "
-                f"increase --max-pages above {max_pages}."
+        self.zenodo_scan_complete = (
+            records_seen >= reported_total if reported_total is not None else exhausted
+        )
+        if not self.zenodo_scan_complete:
+            message = (
+                f"Zenodo scan incomplete or changed during pagination: scanned {records_seen} unique records "
+                f"of {reported_total}; increase --max-pages above {max_pages} or rerun with --refresh-zenodo."
             )
+            if not self.allow_partial_scan:
+                raise RuntimeError(message)
+            logging.warning("%s Partial output was explicitly allowed for testing.", message)
+
+    def html_file_body(self, record: dict[str, Any]) -> tuple[str, str]:
+        record_id = str(record.get("id") or record.get("recid") or "")
+        for file_info in record.get("files") or []:
+            if not isinstance(file_info, dict) or not str(file_info.get("key") or "").lower().endswith(".html"):
+                continue
+            url = (file_info.get("links") or {}).get("self")
+            if not url:
+                continue
+            try:
+                body = clean_review_html(self.cached_text_request("zenodo_files", f"{record_id}|html", url))
+                if body:
+                    return body, "html_attachment"
+            except Exception as exc:
+                logging.warning("Unable to read HTML body for record %s: %s", record_id, exc)
+        return "", ""
 
     def review_body(self, record: dict[str, Any]) -> str:
-        metadata = record.get("metadata") or {}
-        body = clean_review_html(metadata.get("description"))
+        body = clean_review_html((record.get("metadata") or {}).get("description"))
         if body:
             return body
-        for file_info in record.get("files") or []:
-            if not isinstance(file_info, dict):
-                continue
-            if str(file_info.get("key") or "").lower().endswith((".html", ".txt", ".md")):
-                url = (file_info.get("links") or {}).get("self")
-                if url:
-                    try:
-                        return clean_review_html(self.get_text(url))
-                    except Exception:
-                        continue
-        return ""
+        body, _ = self.html_file_body(record)
+        return body
+
+    def discussion_body(self, record: dict[str, Any]) -> tuple[str, str]:
+        body, source = self.html_file_body(record)
+        if body:
+            return body, source
+        description = clean_review_html((record.get("metadata") or {}).get("description"))
+        return description, "description" if description else ""
 
     def response_body(self, record: dict[str, Any]) -> tuple[str, str]:
         # Legacy PREreview author responses may store only a one-sentence landing
@@ -876,38 +1036,81 @@ class Collector:
                 if not url:
                     continue
                 try:
-                    document = fitz.open(stream=self.cached_bytes_request("response_files", str(record.get("id") or url), url), filetype="pdf")
+                    document = fitz.open(stream=self.cached_bytes_request("zenodo_files", f"{record.get('id') or url}|pdf", url), filetype="pdf")
                     body = clean_text("\n\n".join(page.get_text("text") for page in document))
                     document.close()
                     if body:
                         return body, "pdf_attachment"
                 except Exception as exc:
                     logging.warning("Unable to extract response PDF for record %s: %s", record.get("id"), exc)
+        html_body, html_source = self.html_file_body(record)
+        if html_body:
+            return html_body, html_source
         description = clean_review_html((record.get("metadata") or {}).get("description"))
         return description, "description" if description else ""
 
     @staticmethod
-    def response_relations(record: dict[str, Any]) -> tuple[str, str]:
-        target_review_id = ""
-        target_paper_doi = ""
+    def is_legacy_response_record(record: dict[str, Any]) -> bool:
+        title = clean_text((record.get("metadata") or {}).get("title"), " ")
+        return bool(re.match(
+            r"^(?:(?:author\s+)?response\s+to\s+.+?\breview\b|rebuttal\b|reply\s+to\b)",
+            title,
+            re.I,
+        ))
+
+    @staticmethod
+    def is_discussion_record(record: dict[str, Any]) -> bool:
+        metadata = record.get("metadata") or {}
+        title = clean_text(metadata.get("title"), " ")
+        description = clean_text(metadata.get("description"), " ")[:500]
+        resource_type = metadata.get("resource_type") or {}
+        is_other_publication = (
+            isinstance(resource_type, dict)
+            and resource_type.get("type") == "publication"
+            and resource_type.get("subtype") == "other"
+        )
+        references_review = any(
+            isinstance(item, dict)
+            and str(item.get("relation") or "").casefold() == "references"
+            and str((item.get("resource_type") or "")).casefold() == "publication-peerreview"
+            for item in metadata.get("related_identifiers") or []
+        )
+        has_comment_html = any(
+            isinstance(item, dict) and str(item.get("key") or "").casefold() == "comment.html"
+            for item in record.get("files") or []
+        )
+        return bool(
+            (is_other_publication and references_review and has_comment_html)
+            or
+            re.match(r"^comment\s+on\s+a\s+PREreview\b", title, re.I)
+            or "permanently preserved version of a comment on a prereview" in description.casefold()
+        )
+
+    @staticmethod
+    def interaction_relations(record: dict[str, Any]) -> list[str]:
+        identifiers: list[str] = []
         for item in (record.get("metadata") or {}).get("related_identifiers") or []:
             if not isinstance(item, dict):
                 continue
             if str(item.get("relation") or "").lower() not in {"cites", "isresponseTo".lower(), "references"}:
                 continue
             candidate = normalize_doi(item.get("identifier") or item.get("id") or item.get("value"))
-            if not candidate:
-                continue
-            if ZENODO_DOI_RE.fullmatch(candidate):
-                target_review_id = target_review_id or candidate
-            else:
-                target_paper_doi = target_paper_doi or candidate
-        return target_review_id, target_paper_doi
+            if candidate and candidate not in identifiers:
+                identifiers.append(candidate)
+        return identifiers
+
+    @staticmethod
+    def relation_matches_target(identifier: str, target: Target) -> bool:
+        if not identifier:
+            return False
+        family_key, _ = family_and_version(identifier, "doi")
+        return family_key == target.family_key or identifier == target.doi
 
     def scan(self, max_pages: int) -> tuple[
         OrderedDict[str, Family],
         dict[str, Any],
         dict[str, list[AuthorResponse]],
+        dict[str, list[DiscussionComment]],
         set[str],
     ]:
         families: OrderedDict[str, Family] = OrderedDict()
@@ -915,8 +1118,11 @@ class Collector:
         stats: Counter[str] = Counter()
         review_types: Counter[str] = Counter()
         possible_responses: list[dict[str, Any]] = []
+        possible_discussions: list[dict[str, Any]] = []
         responses_by_review: dict[str, list[AuthorResponse]] = {}
-        response_family_keys: set[str] = set()
+        discussions_by_review: dict[str, list[DiscussionComment]] = {}
+        interaction_family_keys: set[str] = set()
+        pending_interactions: list[tuple[str, dict[str, Any]]] = []
 
         for record in self.iter_zenodo_records(max_pages):
             record_id = str(record.get("id") or record.get("recid") or "")
@@ -927,41 +1133,13 @@ class Collector:
             stats["records_seen"] += 1
             metadata = record.get("metadata") or {}
             raw_title = clean_text(metadata.get("title"), " ")
-            if re.match(
-                r"^(?:(?:author\s+)?response\s+to\s+.+?\breview\b|rebuttal\b|reply\s+to\b)",
-                raw_title,
-                re.I,
-            ):
-                target_review_id, target_paper_doi = self.response_relations(record)
-                body, body_source = self.response_body(record)
-                response_detail = {
-                    "record_id": record_id,
-                    "title": raw_title,
-                    "response_doi": review_doi(record),
-                    "target_review_id": target_review_id,
-                    "target_paper_doi": target_paper_doi,
-                    "body_source": body_source,
-                    "body_length": len(body),
-                }
-                possible_responses.append(response_detail)
-                if target_review_id and target_paper_doi and body:
-                    family_key, _ = family_and_version(target_paper_doi, "doi")
-                    response = AuthorResponse(
-                        response_id=review_doi(record),
-                        record_id=record_id,
-                        target_review_id=target_review_id,
-                        family_key=family_key,
-                        content=body,
-                        response_date=str(metadata.get("publication_date") or record.get("created") or "")[:10],
-                        record_url=(record.get("links") or {}).get("self_html") or f"https://zenodo.org/records/{record_id}",
-                        creators=creators_from_record(record),
-                        body_source=body_source,
-                    )
-                    responses_by_review.setdefault(target_review_id, []).append(response)
-                    response_family_keys.add(family_key)
-                    stats["author_responses_accepted"] += 1
-                else:
-                    stats["author_responses_unresolved"] += 1
+            if self.is_legacy_response_record(record):
+                pending_interactions.append(("author_response", record))
+                stats["author_response_records_seen"] += 1
+                continue
+            if self.is_discussion_record(record):
+                pending_interactions.append(("discussion", record))
+                stats["discussion_records_seen"] += 1
                 continue
             target, reason = explicit_target(record)
             if target is None:
@@ -978,6 +1156,7 @@ class Collector:
                 continue
             review_type, title_hint = review_type_and_title(raw_title)
             review_types[review_type] += 1
+            creator_names, creator_orcids = creator_identities_from_record(record)
             review = Review(
                 review_id=review_doi(record),
                 record_id=record_id,
@@ -987,7 +1166,8 @@ class Collector:
                 review_type=review_type,
                 title_hint=title_hint,
                 record_url=(record.get("links") or {}).get("self_html") or f"https://zenodo.org/records/{record_id}",
-                creators=creators_from_record(record),
+                creators=creator_names,
+                creator_orcids=creator_orcids,
                 subjects=subjects_from_record(record),
             )
             family = families.setdefault(target.family_key, Family(target.family_key))
@@ -998,14 +1178,121 @@ class Collector:
             bucket.reviews.append(review)
             stats["reviews_accepted"] += 1
 
+        reviews_by_id = {
+            review.review_id: review
+            for family in families.values()
+            for bucket in family.targets.values()
+            for review in bucket.reviews
+        }
+        for interaction_kind, record in pending_interactions:
+            record_id = str(record.get("id") or record.get("recid") or "")
+            metadata = record.get("metadata") or {}
+            raw_title = clean_text(metadata.get("title"), " ")
+            related = self.interaction_relations(record)
+            linked_review_ids = [identifier for identifier in related if identifier in reviews_by_id]
+            target_review_id = linked_review_ids[0] if len(linked_review_ids) == 1 else ""
+            target_review = reviews_by_id.get(target_review_id)
+            target_verified = bool(
+                target_review
+                and any(
+                    identifier != target_review_id
+                    and self.relation_matches_target(identifier, target_review.target)
+                    for identifier in related
+                )
+            )
+            body, body_source = (
+                self.response_body(record)
+                if interaction_kind == "author_response"
+                else self.discussion_body(record)
+            )
+            detail = {
+                "record_id": record_id,
+                "title": raw_title,
+                "interaction_doi": review_doi(record),
+                "related_identifiers": related,
+                "target_review_id": target_review_id,
+                "target_paper_identifier": target_review.target.value if target_review else "",
+                "target_relation_verified": target_verified,
+                "body_source": body_source,
+                "body_length": len(body),
+            }
+            if interaction_kind == "author_response":
+                possible_responses.append(detail)
+            else:
+                possible_discussions.append(detail)
+            if not target_review_id or target_review is None or not body:
+                stats[f"{interaction_kind}_unresolved"] += 1
+                continue
+            family_key = target_review.target.family_key
+            interaction_family_keys.add(family_key)
+            creator_names, creator_orcids = creator_identities_from_record(record)
+            if interaction_kind == "author_response":
+                response = AuthorResponse(
+                    response_id=review_doi(record),
+                    record_id=record_id,
+                    target_review_id=target_review_id,
+                    family_key=family_key,
+                    content=body,
+                    response_date=str(metadata.get("publication_date") or record.get("created") or "")[:10],
+                    record_url=(record.get("links") or {}).get("self_html") or f"https://zenodo.org/records/{record_id}",
+                    creators=creator_names,
+                    creator_orcids=creator_orcids,
+                    body_source=body_source,
+                )
+                responses_by_review.setdefault(target_review_id, []).append(response)
+                stats["author_responses_accepted"] += 1
+            else:
+                discussion = DiscussionComment(
+                    comment_id=review_doi(record),
+                    record_id=record_id,
+                    target_review_id=target_review_id,
+                    family_key=family_key,
+                    content=body,
+                    comment_date=str(metadata.get("publication_date") or record.get("created") or "")[:10],
+                    record_url=(record.get("links") or {}).get("self_html") or f"https://zenodo.org/records/{record_id}",
+                    creators=creator_names,
+                    creator_orcids=creator_orcids,
+                    body_source=body_source,
+                    target_relation_verified=target_verified,
+                )
+                discussions_by_review.setdefault(target_review_id, []).append(discussion)
+                stats["discussion_comments_accepted"] += 1
+                if not target_verified:
+                    stats["discussion_target_relation_unverified"] += 1
+
         report = dict(stats)
+        report["zenodo_duplicate_records_during_pagination"] = self.zenodo_duplicate_records
+        report["zenodo_reported_total"] = self.zenodo_reported_total
+        report["zenodo_scan_complete"] = self.zenodo_scan_complete
+        review_dates = [
+            review.review_date
+            for family in families.values()
+            for bucket in family.targets.values()
+            for review in bucket.reviews
+            if review.review_date
+        ]
+        report["reviews_before_commenting_relaunch"] = sum(
+            date < COMMENTING_RELAUNCH_DATE for date in review_dates
+        )
+        report["reviews_on_or_after_commenting_relaunch"] = sum(
+            date >= COMMENTING_RELAUNCH_DATE for date in review_dates
+        )
+        report["historical_comment_completeness"] = "unverified_before_commenting_relaunch"
         report["strict_families"] = len(families)
         report["strict_target_versions"] = sum(len(family.targets) for family in families.values())
         report["review_types"] = dict(review_types)
         report["author_response_records"] = possible_responses[:50]
         report["author_response_record_count"] = len(possible_responses)
-        report["author_response_family_count"] = len(response_family_keys)
-        return families, report, responses_by_review, response_family_keys
+        report["discussion_records"] = possible_discussions[:100]
+        report["discussion_record_count"] = len(possible_discussions)
+        report["author_response_family_count"] = len({
+            response.family_key for values in responses_by_review.values() for response in values
+        })
+        report["discussion_family_count"] = len({
+            discussion.family_key for values in discussions_by_review.values() for discussion in values
+        })
+        report["interaction_family_count"] = len(interaction_family_keys)
+        return families, report, responses_by_review, discussions_by_review, interaction_family_keys
 
     def crossref_metadata(self, doi_value: str) -> dict[str, Any]:
         params = {"mailto": self.crossref_mailto} if self.crossref_mailto else None
@@ -1030,7 +1317,7 @@ class Collector:
             if isinstance(link, dict):
                 venue_candidates.append(link.get("URL"))
         return {
-            "title": title, "authors": authors, "year": year,
+            "title": title, "authors": authors, "author_orcids": orcids_from_people(msg.get("author")), "year": year,
             "venue_candidates": venue_candidates,
             "fields": [clean_text(item, " ") for item in msg.get("subject") or [] if clean_text(item, " ")],
             "source": "Crossref",
@@ -1076,7 +1363,7 @@ class Collector:
             if value and value not in fields:
                 fields.append(value)
         return {
-            "title": title, "authors": authors, "year": year,
+            "title": title, "authors": authors, "author_orcids": orcids_from_people(creators), "year": year,
             "venue_candidates": venue_candidates, "fields": fields, "source": "DataCite",
         }
 
@@ -1104,6 +1391,11 @@ class Collector:
                 clean_text((authorship.get("author") or {}).get("display_name"), " ")
                 for authorship in payload.get("authorships") or []
                 if clean_text((authorship.get("author") or {}).get("display_name"), " ")
+            ],
+            "author_orcids": [
+                orcid
+                for authorship in payload.get("authorships") or []
+                if (orcid := normalize_orcid((authorship.get("author") or {}).get("orcid")))
             ],
             "year": str(payload.get("publication_year") or ""),
             "venue_candidates": [
@@ -1133,7 +1425,7 @@ class Collector:
             if clean_text(node.attrib.get("term"), " ")
         ]
         return {
-            "title": title, "authors": [a for a in authors if a], "year": year,
+            "title": title, "authors": [a for a in authors if a], "author_orcids": [], "year": year,
             "venue_candidates": ["arXiv"], "fields": fields, "source": "arXiv API",
         }
 
@@ -1148,17 +1440,14 @@ class Collector:
             self.metadata_cache[cache_key] = value
             return value
         merged: dict[str, Any] = {
-            "title": "", "authors": [], "year": "", "venue_candidates": [],
+            "title": "", "authors": [], "author_orcids": [], "year": "", "venue_candidates": [],
             "field_candidates": [], "sources": [],
-            "provenance": {"title": [], "authors": [], "year": [], "venue": [], "field": []},
+            "provenance": {"title": [], "authors": [], "author_orcids": [], "year": [], "venue": [], "field": []},
         }
         resolvers: list[Any] = []
         if target.kind == "arxiv":
             resolvers = [lambda: self.arxiv_metadata(target.value)]
         elif target.kind == "doi":
-            if target.doi.startswith("10.48550/arxiv."):
-                arxiv_id = target.doi.split("10.48550/arxiv.", 1)[1]
-                resolvers.append(lambda arxiv_id=arxiv_id: self.arxiv_metadata(arxiv_id))
             datacite_first = target.doi.startswith(LIKELY_DATACITE_PREFIXES)
             registry_resolvers = []
             if datacite_first:
@@ -1168,6 +1457,9 @@ class Collector:
                 if self.use_crossref: registry_resolvers.append(lambda: self.crossref_metadata(target.doi))
                 if self.use_datacite: registry_resolvers.append(lambda: self.datacite_metadata(target.doi))
             resolvers.extend(registry_resolvers)
+            if target.doi.startswith("10.48550/arxiv."):
+                arxiv_id = target.doi.split("10.48550/arxiv.", 1)[1]
+                resolvers.append(lambda arxiv_id=arxiv_id: self.arxiv_metadata(arxiv_id))
             if self.use_openalex:
                 resolvers.append(lambda: self.openalex_metadata(target.doi))
         for resolver in resolvers:
@@ -1188,6 +1480,12 @@ class Collector:
                 if not merged[field_name] and candidate:
                     merged[field_name] = candidate
                     merged["provenance"][field_name].append(source)
+            for orcid in value.get("author_orcids") or []:
+                normalized = normalize_orcid(orcid)
+                if normalized and normalized not in merged["author_orcids"]:
+                    merged["author_orcids"].append(normalized)
+                    if source not in merged["provenance"]["author_orcids"]:
+                        merged["provenance"]["author_orcids"].append(source)
             venue_values = value.get("venue_candidates") or []
             if venue_values:
                 merged["venue_candidates"].extend(venue_values)
@@ -1218,7 +1516,9 @@ class Collector:
         self,
         family: Family,
         responses_by_review: dict[str, list[AuthorResponse]],
+        discussions_by_review: dict[str, list[DiscussionComment]] | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        discussions_by_review = discussions_by_review or {}
         buckets = list(family.targets.values())
         buckets.sort(key=lambda bucket: (
             bucket.target.version is None,
@@ -1248,16 +1548,27 @@ class Collector:
         title = clean_title(latest.get("title") or hint)
         similarity = title_similarity(title, hint) if hint else 1.0
         authors = latest.get("authors") or []
+        author_orcids = latest.get("author_orcids") or []
         years = [str(metadata.get("year")) for _, metadata in resolved if re.fullmatch(r"\d{4}", str(metadata.get("year") or ""))]
         year = min(years) if years else ""
-        venue = latest.get("venue") or next((metadata.get("venue") for _, metadata in reversed(resolved) if metadata.get("venue")), "")
+        venue = (
+            latest.get("venue")
+            or next((metadata.get("venue") for _, metadata in reversed(resolved) if metadata.get("venue")), "")
+            or venue_from_identifier(latest_bucket.target)
+        )
         missing = [name for name, value in (("title", title), ("authors", authors), ("year", year), ("venue", venue)) if not value]
         if missing:
             rejection.update({"reason": "metadata_incomplete", "missing": missing, "metadata_sources": latest.get("sources")})
             return None, rejection
+        metadata_warnings: list[dict[str, Any]] = []
         if similarity < 0.58:
-            rejection.update({"reason": "title_mismatch", "metadata_title": title, "review_title": hint, "similarity": similarity})
-            return None, rejection
+            metadata_warnings.append({
+                "warning": "title_mismatch",
+                "metadata_title": title,
+                "review_title": hint,
+                "similarity": similarity,
+                "resolution": "accepted because Zenodo explicitly declares relation=reviews to the DOI",
+            })
         if any(fragment in f" {venue.lower()}" for fragment in FORBIDDEN_VENUE_FRAGMENTS):
             rejection.update({"reason": "publisher_used_as_venue", "venue": venue})
             return None, rejection
@@ -1268,15 +1579,18 @@ class Collector:
         rounds: list[dict[str, Any]] = []
         audit_rounds: list[dict[str, Any]] = []
         all_dedup: list[dict[str, Any]] = []
+        all_discussion_dedup: list[dict[str, Any]] = []
         for round_index, bucket in enumerate(buckets, start=1):
             original_reviews = sorted(bucket.reviews, key=lambda review: (review.review_date, review.review_id))
             kept_reviews: list[Review] = []
+            cleaned_review_bodies: dict[str, str] = {}
             body_hash_to_review: dict[str, Review] = {}
             duplicate_to_kept: dict[str, str] = {}
             duplicate_details: list[dict[str, Any]] = []
             for review in original_reviews:
-                review.comment = clean_comment(review.comment)
-                body_hash = normalized_comment_hash(review.comment)
+                cleaned_review = clean_comment(review.comment)
+                cleaned_review_bodies[review.review_id] = cleaned_review
+                body_hash = normalized_comment_hash(cleaned_review)
                 existing = body_hash_to_review.get(body_hash)
                 if existing is None:
                     body_hash_to_review[body_hash] = review
@@ -1298,10 +1612,24 @@ class Collector:
                     }
                     duplicate_details.append(detail)
                     all_dedup.append(detail)
-            comments = [{"Reviewer_ID": review.review_id, "Comment": review.comment} for review in kept_reviews]
-            round_responses: list[dict[str, str]] = []
+            comments = [
+                {
+                    "Reviewer_ID": review.review_id,
+                    "Reviewer": review.creators,
+                    "Reviewer_ORCID": review.creator_orcids,
+                    "Review_Date": review.review_date,
+                    "Comment": cleaned_review_bodies[review.review_id],
+                }
+                for review in kept_reviews
+            ]
+            round_responses: list[dict[str, Any]] = []
             audit_responses: list[dict[str, Any]] = []
+            round_discussions: list[dict[str, Any]] = []
+            audit_discussions: list[dict[str, Any]] = []
             seen_response_ids: set[str] = set()
+            seen_discussion_ids: set[str] = set()
+            discussion_keys: dict[tuple[str, str, tuple[tuple[str, ...], ...]], str] = {}
+            duplicate_discussion_details: list[dict[str, Any]] = []
             review_by_id = {review.review_id: review for review in original_reviews}
             for original_review in original_reviews:
                 canonical_review_id = duplicate_to_kept.get(original_review.review_id, original_review.review_id)
@@ -1310,23 +1638,137 @@ class Collector:
                     if response.family_key != family.key or response.response_id in seen_response_ids:
                         continue
                     seen_response_ids.add(response.response_id)
-                    cleaned_response = author_only_response(response.content, canonical_review.comment)
-                    round_responses.append({"To_Reviewer_ID": canonical_review_id, "Response": cleaned_response})
+                    cleaned_response = author_only_response(
+                        response.content,
+                        cleaned_review_bodies.get(canonical_review.review_id, canonical_review.comment),
+                    )
+                    round_responses.append({
+                        "Response_ID": response.response_id,
+                        "To_Reviewer_ID": canonical_review_id,
+                        "Responder": response.creators,
+                        "Responder_ORCID": response.creator_orcids,
+                        "Response_Date": response.response_date,
+                        "Response": cleaned_response,
+                    })
                     audit_responses.append({
                         "response_id": response.response_id,
                         "response_record_id": response.record_id,
                         "response_url": response.record_url,
                         "response_date": response.response_date,
                         "authors": response.creators,
+                        "author_orcids": response.creator_orcids,
                         "body_source": response.body_source,
                         "to_review_id_original": original_review.review_id,
                         "to_review_id_output": canonical_review_id,
                     })
+                for discussion in sorted(
+                    discussions_by_review.get(original_review.review_id, []),
+                    key=lambda value: (value.comment_date, value.comment_id),
+                ):
+                    if discussion.family_key != family.key or discussion.comment_id in seen_discussion_ids:
+                        continue
+                    seen_discussion_ids.add(discussion.comment_id)
+                    cleaned_discussion = clean_comment(discussion.content)
+                    participant_key = tuple(sorted(
+                        key for creator in discussion.creators
+                        if (key := normalized_person_tokens(creator))
+                    ))
+                    duplicate_key = (
+                        canonical_review_id,
+                        normalized_comment_hash(cleaned_discussion),
+                        participant_key,
+                    )
+                    kept_discussion_id = discussion_keys.get(duplicate_key)
+                    if kept_discussion_id:
+                        duplicate_detail = {
+                            "round": round_index,
+                            "target_review_id": canonical_review_id,
+                            "kept_comment_id": kept_discussion_id,
+                            "removed_comment_id": discussion.comment_id,
+                            "removed_comment_record_id": discussion.record_id,
+                            "removed_comment_url": discussion.record_url,
+                            "commenters": discussion.creators,
+                            "normalized_comment_sha256": duplicate_key[1],
+                        }
+                        duplicate_discussion_details.append(duplicate_detail)
+                        all_discussion_dedup.append(duplicate_detail)
+                        continue
+                    discussion_keys[duplicate_key] = discussion.comment_id
+                    role, role_evidence = discussion_participant_role(
+                        discussion,
+                        authors,
+                        canonical_review.creators,
+                        author_orcids,
+                        canonical_review.creator_orcids,
+                    )
+                    round_discussions.append({
+                        "Comment_ID": discussion.comment_id,
+                        "In_Reply_To_Reviewer_ID": canonical_review_id,
+                        "Commenter": discussion.creators,
+                        "Commenter_ORCID": discussion.creator_orcids,
+                        "Commenter_Role": role,
+                        "Comment_Type": {
+                            "author": "author_response",
+                            "reviewer": "reviewer_followup",
+                            "commenter": "community_comment",
+                        }[role],
+                        "Comment_Date": discussion.comment_date,
+                        "Comment": cleaned_discussion,
+                    })
+                    audit_discussions.append({
+                        "comment_id": discussion.comment_id,
+                        "comment_record_id": discussion.record_id,
+                        "comment_url": discussion.record_url,
+                        "comment_date": discussion.comment_date,
+                        "commenters": discussion.creators,
+                        "commenter_orcids": discussion.creator_orcids,
+                        "participant_role": role,
+                        "participant_role_evidence": role_evidence,
+                        "body_source": discussion.body_source,
+                        "target_relation_verified": discussion.target_relation_verified,
+                        "to_review_id_original": original_review.review_id,
+                        "to_review_id_output": canonical_review_id,
+                    })
+            round_responses.sort(key=lambda value: (value.get("Response_Date") or "", value.get("Response_ID") or ""))
+            round_discussions.sort(key=lambda value: (value.get("Comment_Date") or "", value.get("Comment_ID") or ""))
+            audit_responses.sort(key=lambda value: (value.get("response_date") or "", value.get("response_id") or ""))
+            audit_discussions.sort(key=lambda value: (value.get("comment_date") or "", value.get("comment_id") or ""))
+            timeline = [
+                {
+                    "Event_Type": "review",
+                    "Event_ID": review.review_id,
+                    "Actor_Role": "reviewer",
+                    "Date": review.review_date,
+                    "In_Reply_To": "",
+                }
+                for review in kept_reviews
+            ]
+            timeline.extend({
+                "Event_Type": "legacy_author_response",
+                "Event_ID": response["Response_ID"],
+                "Actor_Role": "author",
+                "Date": response["Response_Date"],
+                "In_Reply_To": response["To_Reviewer_ID"],
+            } for response in round_responses)
+            timeline.extend({
+                "Event_Type": discussion["Comment_Type"],
+                "Event_ID": discussion["Comment_ID"],
+                "Actor_Role": discussion["Commenter_Role"],
+                "Date": discussion["Comment_Date"],
+                "In_Reply_To": discussion["In_Reply_To_Reviewer_ID"],
+            } for discussion in round_discussions)
+            timeline.sort(key=lambda value: (
+                value.get("Date") or "",
+                0 if value.get("Event_Type") == "review" else 1,
+                value.get("Event_ID") or "",
+            ))
             rounds.append({
                 "Round": round_index,
                 "Target_DOI": bucket.target.doi,
                 "Comments": comments,
                 "Response": round_responses,
+                "Discussion": round_discussions,
+                "Timeline": timeline,
             })
             audit_rounds.append({
                 "round": round_index,
@@ -1341,11 +1783,14 @@ class Collector:
                         "review_date": review.review_date,
                         "review_type": review.review_type,
                         "reviewers": review.creators,
+                        "reviewer_orcids": review.creator_orcids,
                     }
                     for review in kept_reviews
                 ],
                 "duplicate_review_records_removed": duplicate_details,
+                "duplicate_discussion_records_removed": duplicate_discussion_details,
                 "responses": audit_responses,
+                "discussion": audit_discussions,
             })
 
         field_candidates: list[dict[str, str]] = []
@@ -1395,6 +1840,7 @@ class Collector:
             "output_doi": latest_doi,
             "title_similarity": round(similarity, 4),
             "title_hint": hint,
+            "metadata_warnings": metadata_warnings,
             "metadata_sources": latest.get("sources") or [],
             "field": field_value,
             "field_candidates": field_candidates,
@@ -1403,14 +1849,19 @@ class Collector:
                 "DOI": ["Zenodo related_identifier with relation=reviews"],
                 "PaperTitle": provenance.get("title") or (["PREreview review title"] if title == hint and hint else []),
                 "Authors": provenance.get("authors") or [],
+                "Author_ORCIDs": provenance.get("author_orcids") or [],
                 "Source": ["constant: PREreview"],
                 "Venue": venue_sources,
                 "Year": year_sources,
-                "PeerReview": ["PREreview review records preserved by Zenodo"],
+                "PeerReview": [
+                    "PREreview review and discussion records preserved by Zenodo",
+                    "explicit related_identifiers connect each discussion to its PREreview record",
+                ],
                 "Field": sorted({item["source"] for item in field_candidates}),
             },
             "versions": len(buckets),
             "duplicate_review_records_removed": all_dedup,
+            "duplicate_discussion_records_removed": all_discussion_dedup,
             "rounds": audit_rounds,
         }
         return paper, audit
@@ -1482,18 +1933,18 @@ class Collector:
         return checkpoint
 
     def collect(self, limit: int, max_pages: int) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
-        families, scan_stats, responses_by_review, response_family_keys = self.scan(max_pages)
+        families, scan_stats, responses_by_review, discussions_by_review, interaction_family_keys = self.scan(max_pages)
         family_values = list(families.values())
         response_linked = sorted(
-            (family for family in family_values if family.key in response_family_keys),
+            (family for family in family_values if family.key in interaction_family_keys),
             key=lambda family: self.family_hash(family.key),
         )
         multi_version = sorted(
-            (family for family in family_values if len(family.targets) > 1 and family.key not in response_family_keys),
+            (family for family in family_values if len(family.targets) > 1 and family.key not in interaction_family_keys),
             key=lambda family: self.family_hash(family.key),
         )
         single_version = sorted(
-            (family for family in family_values if len(family.targets) == 1 and family.key not in response_family_keys),
+            (family for family in family_values if len(family.targets) == 1 and family.key not in interaction_family_keys),
             key=lambda family: self.family_hash(family.key),
         )
         if self.sampling_policy == "coverage":
@@ -1531,7 +1982,7 @@ class Collector:
             try:
                 for family_index in range(next_family_index, len(ordered)):
                     family = ordered[family_index]
-                    paper, detail = self.build_family(family, responses_by_review)
+                    paper, detail = self.build_family(family, responses_by_review, discussions_by_review)
                     if paper is None:
                         rejection_counts[detail.get("reason", "unknown")] += 1
                         if len(rejection_examples) < 30:
@@ -1600,11 +2051,15 @@ class Collector:
         stats = {
             "platform": "PREreview",
             "source": "Zenodo community prereview-reviews",
-            "association_policy": "Only explicit Zenodo related_identifiers with relation=reviews; no DOI extraction from prose, references, titles, or arbitrary links.",
+            "association_policy": (
+                "Reviews require explicit Zenodo related_identifiers with relation=reviews; "
+                "responses and discussions require explicit links to a known review DOI; "
+                "no DOI extraction from prose, titles, or arbitrary links."
+            ),
             "sample_policy": (
                 "Deterministic SHA-256 ordering across all strict families after a complete community scan."
                 if self.sampling_policy == "hash" else
-                "Coverage-prioritized ordering: author responses, multi-version families, then deterministic SHA-256 fill."
+                "Coverage-prioritized ordering: discussion/response families, multi-version families, then deterministic SHA-256 fill."
             ),
             "seed": self.seed,
             "requested": limit,
@@ -1641,6 +2096,11 @@ class Collector:
                 "empty_doi": sum(not paper["DOI"] for paper in papers),
                 "nonempty_field": sum(bool(paper["Field"]) for paper in papers),
                 "responses_found": sum(len(round_data["Response"]) for paper in papers for round_data in paper["PeerReview"]),
+                "discussion_comments_found": sum(
+                    len(round_data.get("Discussion") or [])
+                    for paper in papers
+                    for round_data in paper["PeerReview"]
+                ),
             },
             "request_counts": dict(self.request_counts),
             "reviewer_id_semantics": "Stable PREreview review-record DOI, analogous to the F1000 report ID used in the provided schema.",
@@ -1653,6 +2113,8 @@ def serializable_round(round_data: dict[str, Any], extended: bool) -> dict[str, 
         "Round": round_data["Round"],
         "Comments": round_data["Comments"],
         "Response": round_data["Response"],
+        "Discussion": round_data.get("Discussion", []),
+        "Timeline": round_data.get("Timeline", []),
     }
     if extended:
         value["Target_DOI"] = round_data.get("Target_DOI", "")
@@ -1696,6 +2158,16 @@ def contains_real_html(value: str) -> bool:
     return any((tag.name or "").lower() in KNOWN_HTML_TAGS for tag in soup.find_all())
 
 
+def valid_orcid_list(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, str) and normalize_orcid(item) == item for item in value
+    )
+
+
+def valid_iso_date(value: Any) -> bool:
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "")))
+
+
 def validate_csv(path: Path, expected: int) -> list[str]:
     with path.open(encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
@@ -1719,7 +2191,7 @@ def validate_csv(path: Path, expected: int) -> list[str]:
         doi_value = row.get("DOI") or ""
         if doi_value:
             normalized = normalize_doi(doi_value)
-            if not normalized or ZENODO_DOI_RE.fullmatch(normalized):
+            if not normalized:
                 issues.append(f"row {row_number}: invalid paper DOI {doi_value!r}")
             family_key = canonical_family_from_output_doi(doi_value)
             if family_key in family_keys:
@@ -1758,28 +2230,127 @@ def validate_csv(path: Path, expected: int) -> list[str]:
                 continue
             comments = round_data.get("Comments")
             responses = round_data.get("Response")
+            discussions = round_data.get("Discussion")
+            timeline = round_data.get("Timeline")
             if not isinstance(comments, list) or not comments:
                 issues.append(f"row {row_number}: empty Comments")
                 continue
             if not isinstance(responses, list):
                 issues.append(f"row {row_number}: Response is not list")
                 responses = []
+            if not isinstance(discussions, list):
+                issues.append(f"row {row_number}: Discussion is not list")
+                discussions = []
+            if not isinstance(timeline, list) or not timeline:
+                issues.append(f"row {row_number}: Timeline is not a non-empty list")
+                timeline = []
             round_review_ids = {
                 str(comment.get("Reviewer_ID") or "") for comment in comments if isinstance(comment, dict)
             }
+            seen_response_ids: set[str] = set()
             for response in responses:
-                if not isinstance(response, dict) or not str(response.get("To_Reviewer_ID") or "").strip() or not str(response.get("Response") or "").strip():
+                if not isinstance(response, dict):
                     issues.append(f"row {row_number}: invalid response")
-                elif str(response.get("To_Reviewer_ID")) not in round_review_ids:
+                    continue
+                response_id = str(response.get("Response_ID") or "")
+                response_target = str(response.get("To_Reviewer_ID") or "")
+                if not response_id or not response_target or not str(response.get("Response") or "").strip():
+                    issues.append(f"row {row_number}: invalid response")
+                elif response_target not in round_review_ids:
                     issues.append(f"row {row_number}: response points to a review not present in the same round")
                 elif contains_real_html(str(response.get("Response") or "")):
                     issues.append(f"row {row_number}: HTML remains in response")
+                if response_id in seen_response_ids:
+                    issues.append(f"row {row_number}: duplicate response ID {response_id}")
+                seen_response_ids.add(response_id)
+                if not valid_iso_date(response.get("Response_Date")):
+                    issues.append(f"row {row_number}: invalid response date")
+                if not valid_orcid_list(response.get("Responder_ORCID")):
+                    issues.append(f"row {row_number}: invalid responder ORCID list")
+            seen_discussion_ids: set[str] = set()
+            previous_discussion_order: tuple[str, str] | None = None
+            for discussion in discussions:
+                if not isinstance(discussion, dict):
+                    issues.append(f"row {row_number}: discussion entry is not object")
+                    continue
+                discussion_id = str(discussion.get("Comment_ID") or "")
+                target_review_id = str(discussion.get("In_Reply_To_Reviewer_ID") or "")
+                body = str(discussion.get("Comment") or "")
+                role = str(discussion.get("Commenter_Role") or "")
+                comment_type = str(discussion.get("Comment_Type") or "")
+                date = str(discussion.get("Comment_Date") or "")
+                if not discussion_id or not target_review_id or not body:
+                    issues.append(f"row {row_number}: invalid discussion entry")
+                if not valid_iso_date(date):
+                    issues.append(f"row {row_number}: invalid discussion date")
+                if not valid_orcid_list(discussion.get("Commenter_ORCID")):
+                    issues.append(f"row {row_number}: invalid commenter ORCID list")
+                if target_review_id not in round_review_ids:
+                    issues.append(f"row {row_number}: discussion points to a review not present in the same round")
+                if role not in {"author", "reviewer", "commenter"}:
+                    issues.append(f"row {row_number}: invalid discussion participant role {role!r}")
+                expected_type = {
+                    "author": "author_response",
+                    "reviewer": "reviewer_followup",
+                    "commenter": "community_comment",
+                }.get(role)
+                if comment_type != expected_type:
+                    issues.append(f"row {row_number}: discussion type {comment_type!r} conflicts with role {role!r}")
+                if discussion_id in seen_discussion_ids:
+                    issues.append(f"row {row_number}: duplicate discussion ID {discussion_id}")
+                seen_discussion_ids.add(discussion_id)
+                if contains_real_html(body):
+                    issues.append(f"row {row_number}: HTML remains in discussion")
+                order_key = (date, discussion_id)
+                if previous_discussion_order is not None and order_key < previous_discussion_order:
+                    issues.append(f"row {row_number}: discussion is not chronologically ordered")
+                previous_discussion_order = order_key
+            expected_event_ids = round_review_ids | {
+                str(response.get("Response_ID") or "") for response in responses if isinstance(response, dict)
+            } | seen_discussion_ids
+            timeline_event_ids: list[str] = []
+            previous_timeline_order: tuple[str, int, str] | None = None
+            for event in timeline:
+                if not isinstance(event, dict):
+                    issues.append(f"row {row_number}: timeline event is not object")
+                    continue
+                event_type = str(event.get("Event_Type") or "")
+                event_id = str(event.get("Event_ID") or "")
+                actor_role = str(event.get("Actor_Role") or "")
+                date = str(event.get("Date") or "")
+                reply_to = str(event.get("In_Reply_To") or "")
+                if event_type not in {"review", "legacy_author_response", "author_response", "reviewer_followup", "community_comment"}:
+                    issues.append(f"row {row_number}: invalid timeline event type {event_type!r}")
+                expected_actor_role = {
+                    "review": "reviewer",
+                    "legacy_author_response": "author",
+                    "author_response": "author",
+                    "reviewer_followup": "reviewer",
+                    "community_comment": "commenter",
+                }.get(event_type)
+                if actor_role != expected_actor_role or not event_id or not valid_iso_date(date):
+                    issues.append(f"row {row_number}: invalid timeline event")
+                if event_type != "review" and reply_to not in round_review_ids:
+                    issues.append(f"row {row_number}: timeline reply target is not in the same round")
+                timeline_event_ids.append(event_id)
+                order_key = (date, 0 if event_type == "review" else 1, event_id)
+                if previous_timeline_order is not None and order_key < previous_timeline_order:
+                    issues.append(f"row {row_number}: timeline is not chronologically ordered")
+                previous_timeline_order = order_key
+            if len(timeline_event_ids) != len(set(timeline_event_ids)):
+                issues.append(f"row {row_number}: duplicate timeline event ID")
+            if set(timeline_event_ids) != expected_event_ids:
+                issues.append(f"row {row_number}: timeline does not cover all review-thread events")
             comment_hashes: set[str] = set()
             for comment in comments:
                 review_id = str(comment.get("Reviewer_ID") or "") if isinstance(comment, dict) else ""
                 body = str(comment.get("Comment") or "") if isinstance(comment, dict) else ""
                 if not review_id or not body:
                     issues.append(f"row {row_number}: invalid comment")
+                if not valid_iso_date(comment.get("Review_Date") if isinstance(comment, dict) else ""):
+                    issues.append(f"row {row_number}: invalid review date")
+                if not valid_orcid_list(comment.get("Reviewer_ORCID") if isinstance(comment, dict) else None):
+                    issues.append(f"row {row_number}: invalid reviewer ORCID list")
                 if review_id in review_ids:
                     issues.append(f"row {row_number}: duplicate review ID {review_id}")
                 review_ids.add(review_id)
@@ -1794,11 +2365,35 @@ def validate_csv(path: Path, expected: int) -> list[str]:
     return issues
 
 
-def validate_audit(audit: list[dict[str, Any]], expected: int) -> list[str]:
+def validate_audit(
+    audit: list[dict[str, Any]],
+    expected: int,
+    csv_path: Path | None = None,
+) -> list[str]:
     issues: list[str] = []
     if len(audit) != expected:
         issues.append(f"audit rows={len(audit)}, expected={expected}")
+    csv_rows: list[dict[str, str]] = []
+    if csv_path is not None:
+        with csv_path.open(encoding="utf-8-sig", newline="") as file:
+            csv_rows = list(csv.DictReader(file))
+        if len(csv_rows) != len(audit):
+            issues.append(f"audit/CSV row mismatch: audit={len(audit)}, CSV={len(csv_rows)}")
     for index, item in enumerate(audit, start=1):
+        if index <= len(csv_rows):
+            csv_doi = normalize_doi(csv_rows[index - 1].get("DOI") or "")
+            audit_doi = normalize_doi(str(item.get("output_doi") or ""))
+            if audit_doi != csv_doi:
+                issues.append(
+                    f"audit item {index}: output DOI {audit_doi!r} does not match CSV DOI {csv_doi!r}"
+                )
+            if csv_doi:
+                csv_family = canonical_family_from_output_doi(csv_doi)
+                audit_family = str(item.get("family_key") or "")
+                if audit_family != csv_family:
+                    issues.append(
+                        f"audit item {index}: family {audit_family!r} does not match CSV family {csv_family!r}"
+                    )
         provenance = item.get("field_level_provenance") or {}
         for field_name in ("DOI", "PaperTitle", "Authors", "Source", "Venue", "Year", "PeerReview", "Field"):
             if field_name not in provenance:
@@ -1806,6 +2401,13 @@ def validate_audit(audit: list[dict[str, Any]], expected: int) -> list[str]:
         for round_data in item.get("rounds") or []:
             if not round_data.get("target_identifier"):
                 issues.append(f"audit item {index}: missing target identifier for round {round_data.get('round')}")
+            for discussion in round_data.get("discussion") or []:
+                if not discussion.get("target_relation_verified"):
+                    issues.append(f"audit item {index}: discussion target relation is not independently verified")
+                if discussion.get("participant_role") not in {"author", "reviewer", "commenter"}:
+                    issues.append(f"audit item {index}: invalid discussion participant role")
+                if not discussion.get("participant_role_evidence"):
+                    issues.append(f"audit item {index}: missing discussion role evidence")
     return issues
 
 
@@ -1824,6 +2426,7 @@ def main() -> None:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--refresh-zenodo", action="store_true", help="Refresh the Zenodo community snapshot but reuse metadata caches")
+    parser.add_argument("--allow-partial-scan", action="store_true", help="Allow an intentionally incomplete Zenodo snapshot for small tests")
     parser.add_argument("--refresh-metadata", action="store_true", help="Refresh DOI/arXiv metadata and rebuild rows")
     parser.add_argument("--field-policy", choices=("empty", "native", "metadata", "broad"), default="metadata")
     parser.add_argument("--sampling-policy", choices=("hash", "coverage"), default="hash")
@@ -1851,6 +2454,7 @@ def main() -> None:
         sampling_policy=args.sampling_policy,
         refresh_zenodo=args.refresh_zenodo,
         refresh_metadata=args.refresh_metadata,
+        allow_partial_scan=args.allow_partial_scan,
     )
     records, report, audit = collector.collect(args.limit, args.max_pages)
     output = Path(args.output)
@@ -1858,28 +2462,35 @@ def main() -> None:
     if args.extended_output:
         save_csv(records, Path(args.extended_output), extended=True)
     csv_issues = validate_csv(output, args.limit)
-    audit_issues = validate_audit(audit, args.limit)
+    audit_issues = validate_audit(audit, args.limit, output)
     issues = csv_issues + audit_issues
     report["validation_issues"] = issues
-    dedup_log = [
-        detail
+    review_dedup_log = [
+        {"record_type": "review", **detail}
         for item in audit
         for detail in item.get("duplicate_review_records_removed") or []
     ]
+    discussion_dedup_log = [
+        {"record_type": "discussion", **detail}
+        for item in audit
+        for detail in item.get("duplicate_discussion_records_removed") or []
+    ]
+    dedup_log = review_dedup_log + discussion_dedup_log
     for path in (Path(args.stats), Path(args.audit), Path(args.dedup_log), Path(args.validation_report)):
         path.parent.mkdir(parents=True, exist_ok=True)
-    Path(args.stats).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    Path(args.audit).write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
-    Path(args.dedup_log).write_text(json.dumps(dedup_log, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(Path(args.stats), report)
+    atomic_write_json(Path(args.audit), audit)
+    atomic_write_json(Path(args.dedup_log), dedup_log)
     validation = {
         "status": "passed" if not issues and len(records) == args.limit else "failed",
         "rows": len(records),
         "validation_issues": issues,
-        "duplicate_review_records_removed": len(dedup_log),
+        "duplicate_review_records_removed": len(review_dedup_log),
+        "duplicate_discussion_records_removed": len(discussion_dedup_log),
         "strict_output": str(output),
         "extended_output": args.extended_output,
     }
-    Path(args.validation_report).write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(Path(args.validation_report), validation)
     print(json.dumps({**report, "validation": validation}, ensure_ascii=False, indent=2))
     sys.exit(2 if issues or len(records) != args.limit else 0)
 

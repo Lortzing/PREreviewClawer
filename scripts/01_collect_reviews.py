@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--refresh-zenodo", action="store_true")
+    parser.add_argument("--allow-partial-scan", action="store_true", help="Allow an intentionally incomplete snapshot for small tests")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -31,6 +32,7 @@ def main() -> None:
         delay=args.delay,
         resume=not args.no_resume,
         refresh_zenodo=args.refresh_zenodo,
+        allow_partial_scan=args.allow_partial_scan,
     )
     result = stage1_collect_reviews(
         output=args.output,

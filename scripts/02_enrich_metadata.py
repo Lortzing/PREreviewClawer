@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--retry-missing", action="store_true")
+    parser.add_argument("--allow-partial-scan", action="store_true", help="Accept a deliberately partial stage-1 artifact for testing")
     parser.add_argument("--refresh-metadata", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     boolean_switch(parser, "datacite", True, "Use DataCite DOI metadata.")
@@ -44,6 +45,7 @@ def main() -> None:
         checkpoint_every=args.checkpoint_every,
         resume=not args.no_resume,
         refresh_metadata=args.refresh_metadata,
+        allow_partial_scan=args.allow_partial_scan,
         use_datacite=args.use_datacite,
         use_crossref=args.use_crossref,
         use_openalex=args.use_openalex,

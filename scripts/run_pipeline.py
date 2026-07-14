@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--sampling-policy", choices=["hash", "coverage"], default="hash")
     parser.add_argument("--use-openalex", action="store_true")
     parser.add_argument("--refresh-zenodo", action="store_true")
+    parser.add_argument("--allow-partial-scan", action="store_true", help="Allow an intentionally incomplete snapshot for small tests")
     parser.add_argument("--refresh-metadata", action="store_true")
     parser.add_argument("--retry-missing", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
@@ -45,6 +46,7 @@ def main() -> None:
         checkpoint_every=args.checkpoint_every,
         resume=not args.no_resume,
         refresh_zenodo=args.refresh_zenodo,
+        allow_partial_scan=args.allow_partial_scan,
         refresh_metadata=args.refresh_metadata,
         use_openalex=args.use_openalex,
         field_policy=args.field_policy,
@@ -79,6 +81,7 @@ def main() -> None:
             csv_input=paths["csv"],
             report_output=paths["validation"],
             expected=args.limit,
+            audit_input=paths["audit"],
         ),
     }
     print(json.dumps(reports, ensure_ascii=False, indent=2))

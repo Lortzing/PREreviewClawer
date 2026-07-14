@@ -18,12 +18,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Stage 4: validate the final PREreview CSV.")
     parser.add_argument("--input", type=Path, default=paths["csv"])
     parser.add_argument("--report", type=Path, default=paths["validation"])
+    parser.add_argument("--audit", type=Path, default=paths["audit"])
     parser.add_argument("--expected", type=int, default=200)
     args = parser.parse_args()
     result = stage4_validate_dataset(
         csv_input=args.input,
         report_output=args.report,
         expected=args.expected,
+        audit_input=args.audit,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     sys.exit(0 if result["valid"] else 2)

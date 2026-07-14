@@ -12,3 +12,6 @@ wheels/
 # Pipeline outputs and caches
 data/pipeline/
 .ipynb_checkpoints/
+
+# Local resource snapshot generated before long-running jobs
+.claude_resources.json

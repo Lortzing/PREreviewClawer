@@ -28,6 +28,7 @@ from typing import Any, Iterable
 from prereview_crawler_production import (
     AuthorResponse,
     Collector,
+    DiscussionComment,
     Family,
     Review,
     Target,
@@ -36,9 +37,10 @@ from prereview_crawler_production import (
     load_json,
     save_csv,
     validate_csv,
+    validate_audit,
 )
 
-PIPELINE_SCHEMA_VERSION = 1
+PIPELINE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class PipelineConfig:
     resume: bool = True
     refresh_zenodo: bool = False
     refresh_metadata: bool = False
+    allow_partial_scan: bool = False
     use_datacite: bool = True
     use_crossref: bool = True
     use_openalex: bool = False
@@ -92,6 +95,7 @@ class PipelineConfig:
             sampling_policy=self.sampling_policy,
             refresh_zenodo=self.refresh_zenodo,
             refresh_metadata=self.refresh_metadata,
+            allow_partial_scan=self.allow_partial_scan,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -110,6 +114,27 @@ def require_mapping(path: Path | str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected a JSON object at {path}")
     return value
+
+
+def require_stage_payload(path: Path | str, expected_stage: str) -> dict[str, Any]:
+    value = require_mapping(path)
+    if value.get("pipeline_schema_version") != PIPELINE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported pipeline schema in {path}: {value.get('pipeline_schema_version')!r}; "
+            f"expected {PIPELINE_SCHEMA_VERSION}. Rerun the preceding stage."
+        )
+    if value.get("stage") != expected_stage:
+        raise ValueError(f"Expected stage {expected_stage!r} at {path}, found {value.get('stage')!r}")
+    return value
+
+
+def require_complete_or_explicit_partial(stage1: dict[str, Any], config: PipelineConfig) -> None:
+    scan_complete = (stage1.get("stats") or {}).get("zenodo_scan_complete")
+    if scan_complete is not True and not config.allow_partial_scan:
+        raise ValueError(
+            "Stage 1 is not marked as a complete Zenodo snapshot. Rerun stage 1 with enough pages, "
+            "or pass --allow-partial-scan only for an intentional small test."
+        )
 
 
 def target_to_dict(target: Target) -> dict[str, Any]:
@@ -147,6 +172,7 @@ def review_to_dict(review: Review) -> dict[str, Any]:
         "title_hint": review.title_hint,
         "record_url": review.record_url,
         "creators": review.creators,
+        "creator_orcids": review.creator_orcids,
         "subjects": review.subjects,
     }
 
@@ -162,6 +188,7 @@ def review_from_dict(value: dict[str, Any]) -> Review:
         title_hint=str(value.get("title_hint") or ""),
         record_url=str(value.get("record_url") or ""),
         creators=[str(item) for item in value.get("creators") or [] if str(item).strip()],
+        creator_orcids=[str(item) for item in value.get("creator_orcids") or [] if str(item).strip()],
         subjects=[str(item) for item in value.get("subjects") or [] if str(item).strip()],
     )
 
@@ -176,6 +203,7 @@ def response_to_dict(response: AuthorResponse) -> dict[str, Any]:
         "response_date": response.response_date,
         "record_url": response.record_url,
         "creators": response.creators,
+        "creator_orcids": response.creator_orcids,
         "body_source": response.body_source,
     }
 
@@ -190,7 +218,40 @@ def response_from_dict(value: dict[str, Any]) -> AuthorResponse:
         response_date=str(value.get("response_date") or ""),
         record_url=str(value.get("record_url") or ""),
         creators=[str(item) for item in value.get("creators") or [] if str(item).strip()],
+        creator_orcids=[str(item) for item in value.get("creator_orcids") or [] if str(item).strip()],
         body_source=str(value.get("body_source") or ""),
+    )
+
+
+def discussion_to_dict(discussion: DiscussionComment) -> dict[str, Any]:
+    return {
+        "comment_id": discussion.comment_id,
+        "record_id": discussion.record_id,
+        "target_review_id": discussion.target_review_id,
+        "family_key": discussion.family_key,
+        "content": discussion.content,
+        "comment_date": discussion.comment_date,
+        "record_url": discussion.record_url,
+        "creators": discussion.creators,
+        "creator_orcids": discussion.creator_orcids,
+        "body_source": discussion.body_source,
+        "target_relation_verified": discussion.target_relation_verified,
+    }
+
+
+def discussion_from_dict(value: dict[str, Any]) -> DiscussionComment:
+    return DiscussionComment(
+        comment_id=str(value.get("comment_id") or ""),
+        record_id=str(value.get("record_id") or ""),
+        target_review_id=str(value.get("target_review_id") or ""),
+        family_key=str(value.get("family_key") or ""),
+        content=str(value.get("content") or ""),
+        comment_date=str(value.get("comment_date") or ""),
+        record_url=str(value.get("record_url") or ""),
+        creators=[str(item) for item in value.get("creators") or [] if str(item).strip()],
+        creator_orcids=[str(item) for item in value.get("creator_orcids") or [] if str(item).strip()],
+        body_source=str(value.get("body_source") or ""),
+        target_relation_verified=bool(value.get("target_relation_verified")),
     )
 
 
@@ -232,6 +293,13 @@ def load_responses(stage1_payload: dict[str, Any]) -> dict[str, list[AuthorRespo
     }
 
 
+def load_discussions(stage1_payload: dict[str, Any]) -> dict[str, list[DiscussionComment]]:
+    return {
+        str(review_id): [discussion_from_dict(item) for item in values or []]
+        for review_id, values in (stage1_payload.get("discussions_by_review") or {}).items()
+    }
+
+
 def unique_targets(stage1_payload: dict[str, Any]) -> list[Target]:
     targets: dict[str, Target] = {}
     for family_value in stage1_payload.get("families") or []:
@@ -265,7 +333,7 @@ def stage1_collect_reviews(
     """
 
     collector = config.make_collector(state_suffix="stage1_reviews")
-    families, scan_stats, responses_by_review, response_family_keys = collector.scan(max_pages)
+    families, scan_stats, responses_by_review, discussions_by_review, interaction_family_keys = collector.scan(max_pages)
     payload = {
         "pipeline_schema_version": PIPELINE_SCHEMA_VERSION,
         "stage": "01_reviews",
@@ -273,9 +341,12 @@ def stage1_collect_reviews(
         "source": {
             "platform": "PREreview",
             "archive": "Zenodo community prereview-reviews",
+            "comment_body_policy": "Canonical comment.html attachment, with metadata description only as fallback.",
+            "historical_comment_completeness": "Unverified before commenting relaunched on 2024-11-12.",
             "association_policy": (
-                "Only explicit Zenodo related_identifiers with relation=reviews; "
-                "DOIs found in prose, titles, references, or arbitrary links are ignored."
+                "Reviews require explicit Zenodo related_identifiers with relation=reviews; "
+                "responses and discussions require explicit links to a known review DOI; "
+                "DOIs found in prose, titles, or arbitrary links are ignored."
             ),
         },
         "config": config.public_dict(),
@@ -285,7 +356,14 @@ def stage1_collect_reviews(
             review_id: [response_to_dict(response) for response in responses]
             for review_id, responses in responses_by_review.items()
         },
-        "response_family_keys": sorted(response_family_keys),
+        "discussions_by_review": {
+            review_id: [discussion_to_dict(discussion) for discussion in discussions]
+            for review_id, discussions in discussions_by_review.items()
+        },
+        "response_family_keys": sorted({
+            response.family_key for values in responses_by_review.values() for response in values
+        }),
+        "interaction_family_keys": sorted(interaction_family_keys),
     }
     atomic_write_json(Path(output), payload)
     stats = {
@@ -299,6 +377,7 @@ def stage1_collect_reviews(
             for bucket in family.targets.values()
         ),
         "linked_author_responses": sum(len(items) for items in responses_by_review.values()),
+        "linked_discussion_comments": sum(len(items) for items in discussions_by_review.values()),
         "scan": scan_stats,
         "output": str(output),
     }
@@ -321,13 +400,16 @@ def stage2_resolve_metadata(
     previous attempt produced no metadata.
     """
 
-    stage1 = require_mapping(reviews_input)
+    stage1 = require_stage_payload(reviews_input, "01_reviews")
+    require_complete_or_explicit_partial(stage1, config)
     targets = unique_targets(stage1)
     output_path = Path(output)
     existing = load_json(output_path) if config.resume else None
     records: dict[str, Any] = {}
     if isinstance(existing, dict) and existing.get("pipeline_schema_version") == PIPELINE_SCHEMA_VERSION:
         records = dict(existing.get("records") or {})
+    target_values = {target.value for target in targets}
+    records = {key: value for key, value in records.items() if key in target_values}
 
     collector = config.make_collector(state_suffix="stage2_metadata")
     processed_since_checkpoint = 0
@@ -427,19 +509,19 @@ class SnapshotCollector(Collector):
 def ordered_families(
     collector: Collector,
     families: Iterable[Family],
-    response_family_keys: set[str],
+    interaction_family_keys: set[str],
 ) -> list[Family]:
     values = list(families)
     if collector.sampling_policy == "coverage":
         response_linked = sorted(
-            (family for family in values if family.key in response_family_keys),
+            (family for family in values if family.key in interaction_family_keys),
             key=lambda family: collector.family_hash(family.key),
         )
         multi_version = sorted(
             (
                 family
                 for family in values
-                if len(family.targets) > 1 and family.key not in response_family_keys
+                if len(family.targets) > 1 and family.key not in interaction_family_keys
             ),
             key=lambda family: collector.family_hash(family.key),
         )
@@ -447,7 +529,7 @@ def ordered_families(
             (
                 family
                 for family in values
-                if len(family.targets) == 1 and family.key not in response_family_keys
+                if len(family.targets) == 1 and family.key not in interaction_family_keys
             ),
             key=lambda family: collector.family_hash(family.key),
         )
@@ -469,17 +551,30 @@ def stage3_build_dataset(
 ) -> dict[str, Any]:
     """Assemble the final dataset from frozen review and metadata artifacts."""
 
-    stage1 = require_mapping(reviews_input)
-    stage2 = require_mapping(metadata_input)
+    stage1 = require_stage_payload(reviews_input, "01_reviews")
+    require_complete_or_explicit_partial(stage1, config)
+    stage2 = require_stage_payload(metadata_input, "02_metadata")
     families = load_families(stage1)
     responses_by_review = load_responses(stage1)
-    response_family_keys = set(stage1.get("response_family_keys") or [])
+    discussions_by_review = load_discussions(stage1)
+    interaction_family_keys = set(
+        stage1.get("interaction_family_keys")
+        or stage1.get("response_family_keys")
+        or []
+    )
     metadata_by_target = {
         key: (value.get("metadata") if value.get("status") == "resolved" else None)
         for key, value in (stage2.get("records") or {}).items()
     }
+    required_target_values = {target.value for target in unique_targets(stage1)}
+    missing_stage2_targets = required_target_values - set(metadata_by_target)
+    if missing_stage2_targets:
+        raise ValueError(
+            "Stage 2 does not cover every stage-1 target; rerun stage 2. Missing targets: "
+            + ", ".join(sorted(missing_stage2_targets)[:20])
+        )
     collector = SnapshotCollector(metadata_by_target, config)
-    ordered = ordered_families(collector, families.values(), response_family_keys)
+    ordered = ordered_families(collector, families.values(), interaction_family_keys)
     order_hash = hashlib.sha256(
         "\n".join(family.key for family in ordered).encode("utf-8")
     ).hexdigest()
@@ -536,7 +631,11 @@ def stage3_build_dataset(
             if len(papers) >= limit:
                 next_index = index
                 break
-            paper, detail = collector.build_family(ordered[index], responses_by_review)
+            paper, detail = collector.build_family(
+                ordered[index],
+                responses_by_review,
+                discussions_by_review,
+            )
             if paper is None:
                 reason = str(detail.get("reason") or "unknown")
                 rejection_counts[reason] += 1
@@ -556,21 +655,72 @@ def stage3_build_dataset(
     papers = papers[:limit]
     audit = audit[:limit]
     save_checkpoint(next_index, len(papers) >= limit)
-    save_csv(papers, Path(output), extended=False)
-    if extended_output:
-        save_csv(papers, Path(extended_output), extended=True)
-    atomic_write_json(Path(audit_output), audit)
-    dedup = [
-        detail
+    review_dedup = [
+        {"record_type": "review", **detail}
         for row in audit
         for detail in row.get("duplicate_review_records_removed") or []
     ]
-    atomic_write_json(Path(dedup_output), dedup)
+    discussion_dedup = [
+        {"record_type": "discussion", **detail}
+        for row in audit
+        for detail in row.get("duplicate_discussion_records_removed") or []
+    ]
+    dedup = review_dedup + discussion_dedup
 
     selected_reviews = sum(
         len(round_value.get("Comments") or [])
         for paper in papers
         for round_value in paper.get("PeerReview") or []
+    )
+    selected_family_keys = {str(item.get("family_key") or "") for item in audit}
+    expected_selected_interaction_ids = {
+        interaction.response_id
+        for values in responses_by_review.values()
+        for interaction in values
+        if interaction.family_key in selected_family_keys
+    } | {
+        interaction.comment_id
+        for values in discussions_by_review.values()
+        for interaction in values
+        if interaction.family_key in selected_family_keys
+    }
+    output_interaction_ids = {
+        str(response.get("Response_ID") or "")
+        for paper in papers
+        for round_value in paper.get("PeerReview") or []
+        for response in round_value.get("Response") or []
+    } | {
+        str(discussion.get("Comment_ID") or "")
+        for paper in papers
+        for round_value in paper.get("PeerReview") or []
+        for discussion in round_value.get("Discussion") or []
+    }
+    removed_duplicate_interaction_ids = {
+        str(item.get("removed_comment_id") or "") for item in discussion_dedup
+    }
+    distinct_expected_interaction_ids = expected_selected_interaction_ids - removed_duplicate_interaction_ids
+    missing_interaction_ids = distinct_expected_interaction_ids - output_interaction_ids
+    unexpected_interaction_ids = output_interaction_ids - distinct_expected_interaction_ids
+    if missing_interaction_ids or unexpected_interaction_ids:
+        raise RuntimeError(
+            "Review-thread integrity failure: "
+            f"missing={sorted(missing_interaction_ids)}, unexpected={sorted(unexpected_interaction_ids)}"
+        )
+    save_csv(papers, Path(output), extended=False)
+    if extended_output:
+        save_csv(papers, Path(extended_output), extended=True)
+    atomic_write_json(Path(audit_output), audit)
+    atomic_write_json(Path(dedup_output), dedup)
+    discussion_roles = Counter(
+        str(discussion.get("Commenter_Role") or "unknown")
+        for paper in papers
+        for round_value in paper.get("PeerReview") or []
+        for discussion in round_value.get("Discussion") or []
+    )
+    metadata_warning_counts = Counter(
+        str(warning.get("warning") or "unknown")
+        for item in audit
+        for warning in item.get("metadata_warnings") or []
     )
     stats = {
         "stage": "03_build",
@@ -587,7 +737,21 @@ def stage3_build_dataset(
             for paper in papers
             for round_value in paper.get("PeerReview") or []
         ),
-        "duplicate_review_records_removed": len(dedup),
+        "discussion_comments": sum(
+            len(round_value.get("Discussion") or [])
+            for paper in papers
+            for round_value in paper.get("PeerReview") or []
+        ),
+        "discussion_roles": dict(discussion_roles),
+        "selected_source_interactions": len(expected_selected_interaction_ids),
+        "selected_duplicate_interactions_removed": len(removed_duplicate_interaction_ids),
+        "selected_interactions_expected": len(distinct_expected_interaction_ids),
+        "selected_interactions_written": len(output_interaction_ids),
+        "selected_interactions_missing": [],
+        "selected_interactions_unexpected": [],
+        "metadata_warnings": dict(metadata_warning_counts),
+        "duplicate_review_records_removed": len(review_dedup),
+        "duplicate_discussion_records_removed": len(discussion_dedup),
         "nonempty_field": sum(bool(paper.get("Field")) for paper in papers),
         "metadata_rejections": dict(rejection_counts),
         "metadata_rejection_examples": rejection_examples,
@@ -610,12 +774,20 @@ def stage4_validate_dataset(
     csv_input: Path | str,
     report_output: Path | str,
     expected: int,
+    audit_input: Path | str | None = None,
 ) -> dict[str, Any]:
     issues = validate_csv(Path(csv_input), expected)
+    if audit_input is not None:
+        audit = load_json(Path(audit_input))
+        if not isinstance(audit, list):
+            issues.append(f"audit at {audit_input} is not a JSON list")
+        else:
+            issues.extend(validate_audit(audit, expected, Path(csv_input)))
     report = {
         "stage": "04_validate",
         "generated_at": utc_now(),
         "input": str(csv_input),
+        "audit_input": str(audit_input) if audit_input is not None else "",
         "expected_rows": expected,
         "valid": not issues,
         "issue_count": len(issues),

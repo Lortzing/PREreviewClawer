@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--field-policy", choices=["empty", "native", "metadata", "broad"], default="metadata")
     parser.add_argument("--sampling-policy", choices=["hash", "coverage"], default="hash")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--allow-partial-scan", action="store_true", help="Accept a deliberately partial stage-1 artifact for testing")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = PipelineConfig.from_env(
@@ -40,6 +41,7 @@ def main() -> None:
         resume=not args.no_resume,
         field_policy=args.field_policy,
         sampling_policy=args.sampling_policy,
+        allow_partial_scan=args.allow_partial_scan,
     )
     result = stage3_build_dataset(
         reviews_input=args.reviews,
